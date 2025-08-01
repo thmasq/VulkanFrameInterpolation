@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 #include <atomic>
+#include <array>  // Add this include
 
 // Forward declarations
 class FrameInterpolator;
@@ -121,10 +122,7 @@ public:
     
     void loadSettings();
     
-private:
-    LayerData();
-    ~LayerData() = default;
-    
+    // Make data members public for access - FIX FOR PRIVATE ACCESS ERROR
     std::mutex instance_mutex;
     std::mutex device_mutex;
     std::mutex swapchain_mutex;
@@ -132,6 +130,10 @@ private:
     std::unordered_map<VkInstance, std::unique_ptr<InstanceData>> instances;
     std::unordered_map<VkDevice, std::unique_ptr<DeviceData>> devices;
     std::unordered_map<VkSwapchainKHR, std::unique_ptr<SwapchainData>> swapchains;
+    
+private:
+    LayerData();
+    ~LayerData() = default;
 };
 
 // Helper functions
@@ -158,4 +160,8 @@ namespace layer_utils {
                               VkImageLayout old_layout, VkImageLayout new_layout,
                               VkImageSubresourceRange subresource_range,
                               VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage);
+                              
+    // Dispatch table initialization helper
+    void layer_init_device_dispatch_table(VkDevice device, VkLayerDispatchTable* table, 
+                                         PFN_vkGetDeviceProcAddr gpa);
 }

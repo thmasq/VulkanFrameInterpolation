@@ -25,6 +25,7 @@ target_include_directories(${LAYER_NAME}
         ${Vulkan_INCLUDE_DIRS}
         ${FFX_SDK_DIR}/include
         ${FFX_SDK_DIR}/include/FidelityFX/gpu
+        ${CMAKE_SOURCE_DIR}/include  # Add this for vk_layer_dispatch_table.h
 )
 
 # Link libraries
@@ -35,10 +36,9 @@ target_link_libraries(${LAYER_NAME}
         Threads::Threads
 )
 
-# Compile definitions
+# Compile definitions - REMOVE VK_LAYER_EXPORT definition to avoid conflicts
 target_compile_definitions(${LAYER_NAME}
     PRIVATE
-        VK_LAYER_EXPORT
         VK_USE_PLATFORM_XCB_KHR  # For Linux/X11
         VK_USE_PLATFORM_WAYLAND_KHR  # For Wayland
 )

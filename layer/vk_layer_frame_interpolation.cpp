@@ -5,12 +5,19 @@
 #include <iostream>
 #include <chrono>
 
+// Define VK_LAYER_EXPORT properly for different platforms
+#ifdef _WIN32
+#define VK_LAYER_EXPORT __declspec(dllexport)
+#else
+#define VK_LAYER_EXPORT __attribute__((visibility("default")))
+#endif
+
 // Layer dispatch table setup
 #define DISPATCH_TABLE_ENTRY(table, instance, name) \
     table.name = (PFN_vk##name)vkGetInstanceProcAddr(instance, "vk" #name)
 
 #define DEVICE_DISPATCH_TABLE_ENTRY(table, device, name) \
-    table.name = (PFN_vk##name)vkGetDeviceProcAddr(device, "vk" #name)
+    table->name = (PFN_vk##name)gpa(device, "vk" #name)
 
 // Global layer data implementation
 LayerData::LayerData() {
@@ -95,6 +102,248 @@ SwapchainData* LayerData::getSwapchain(VkSwapchainKHR swapchain) {
     auto it = swapchains.find(swapchain);
     return (it != swapchains.end()) ? it->second.get() : nullptr;
 }
+
+// Helper function implementations
+namespace layer_utils {
+
+uint32_t findMemoryType(const VkPhysicalDeviceMemoryProperties& mem_props,
+                       uint32_t type_filter, VkMemoryPropertyFlags properties) {
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+        if ((type_filter & (1 << i)) && 
+            (mem_props.memoryTypes[i].propertyFlags & properties) == properties) {
+            return i;
+        }
+    }
+    return UINT32_MAX;
+}
+
+VkImageView createImageView(VkDevice device, VkImage image, VkFormat format,
+                           VkImageAspectFlags aspect_flags) {
+    auto device_data = LayerData::getInstance().getDevice(device);
+    if (!device_data) return VK_NULL_HANDLE;
+    
+    VkImageViewCreateInfo view_info = {};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = format;
+    view_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+    view_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+    view_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+    view_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+    view_info.subresourceRange.aspectMask = aspect_flags;
+    view_info.subresourceRange.baseMipLevel = 0;
+    view_info.subresourceRange.levelCount = 1;
+    view_info.subresourceRange.baseArrayLayer = 0;
+    view_info.subresourceRange.layerCount = 1;
+    
+    VkImageView view;
+    device_data->dispatch_table.CreateImageView(device, &view_info, nullptr, &view);
+    return view;
+}
+
+VkSemaphore createSemaphore(VkDevice device) {
+    auto device_data = LayerData::getInstance().getDevice(device);
+    if (!device_data) return VK_NULL_HANDLE;
+    
+    VkSemaphoreCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    
+    VkSemaphore semaphore;
+    device_data->dispatch_table.CreateSemaphore(device, &info, nullptr, &semaphore);
+    return semaphore;
+}
+
+VkFence createFence(VkDevice device, bool signaled) {
+    auto device_data = LayerData::getInstance().getDevice(device);
+    if (!device_data) return VK_NULL_HANDLE;
+    
+    VkFenceCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (signaled) {
+        info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    }
+    
+    VkFence fence;
+    device_data->dispatch_table.CreateFence(device, &info, nullptr, &fence);
+    return fence;
+}
+
+VkCommandBuffer beginSingleTimeCommands(VkDevice device, VkCommandPool pool) {
+    auto device_data = LayerData::getInstance().getDevice(device);
+    if (!device_data) return VK_NULL_HANDLE;
+    
+    VkCommandBufferAllocateInfo alloc_info = {};
+    alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    alloc_info.commandPool = pool;
+    alloc_info.commandBufferCount = 1;
+    
+    VkCommandBuffer cmd_buffer;
+    device_data->dispatch_table.AllocateCommandBuffers(device, &alloc_info, &cmd_buffer);
+    
+    VkCommandBufferBeginInfo begin_info = {};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    
+    device_data->dispatch_table.BeginCommandBuffer(cmd_buffer, &begin_info);
+    return cmd_buffer;
+}
+
+void endSingleTimeCommands(VkDevice device, VkCommandPool pool,
+                          VkQueue queue, VkCommandBuffer cmd_buffer) {
+    auto device_data = LayerData::getInstance().getDevice(device);
+    if (!device_data) return;
+    
+    device_data->dispatch_table.EndCommandBuffer(cmd_buffer);
+    
+    VkSubmitInfo submit_info = {};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &cmd_buffer;
+    
+    device_data->dispatch_table.QueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE);
+    device_data->dispatch_table.QueueWaitIdle(queue);
+    
+    device_data->dispatch_table.FreeCommandBuffers(device, pool, 1, &cmd_buffer);
+}
+
+void transitionImageLayout(VkCommandBuffer cmd, VkImage image,
+                          VkImageLayout old_layout, VkImageLayout new_layout,
+                          VkImageSubresourceRange subresource_range,
+                          VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage) {
+    // Find device data from command buffer (simplified approach)
+    DeviceData* device_data = nullptr;
+    for (auto& [device, data] : LayerData::getInstance().devices) {
+        device_data = data.get();
+        break;
+    }
+    if (!device_data) return;
+    
+    VkImageMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = old_layout;
+    barrier.newLayout = new_layout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange = subresource_range;
+    
+    // Source access mask
+    switch (old_layout) {
+    case VK_IMAGE_LAYOUT_UNDEFINED:
+        barrier.srcAccessMask = 0;
+        break;
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+        barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        break;
+    default:
+        barrier.srcAccessMask = 0;
+        break;
+    }
+    
+    // Destination access mask
+    switch (new_layout) {
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_GENERAL:
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        break;
+    default:
+        barrier.dstAccessMask = 0;
+        break;
+    }
+    
+    device_data->dispatch_table.CmdPipelineBarrier(
+        cmd, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+
+// Initialize device dispatch table - FIX FOR MISSING FUNCTION
+void layer_init_device_dispatch_table(VkDevice device, VkLayerDispatchTable* table, 
+                                     PFN_vkGetDeviceProcAddr gpa) {
+    // Core Vulkan 1.0 functions
+    table->GetDeviceProcAddr = gpa;
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, DestroyDevice);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, GetDeviceQueue);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, QueueSubmit);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, QueueWaitIdle);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, DeviceWaitIdle);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, AllocateMemory);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, FreeMemory);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, MapMemory);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, UnmapMemory);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, BindBufferMemory);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, BindImageMemory);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, GetBufferMemoryRequirements);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, GetImageMemoryRequirements);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, CreateFence);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, DestroyFence);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, ResetFences);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, GetFenceStatus);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, WaitForFences);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, CreateSemaphore);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, DestroySemaphore);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, CreateBuffer);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, DestroyBuffer);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, CreateImage);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, DestroyImage);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, CreateImageView);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, DestroyImageView);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, CreateShaderModule);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, DestroyShaderModule);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, CreatePipelineLayout);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, DestroyPipelineLayout);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, CreateComputePipelines);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, DestroyPipeline);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, CreateDescriptorSetLayout);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, DestroyDescriptorSetLayout);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, CreateDescriptorPool);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, DestroyDescriptorPool);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, AllocateDescriptorSets);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, UpdateDescriptorSets);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, CreateCommandPool);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, DestroyCommandPool);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, AllocateCommandBuffers);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, FreeCommandBuffers);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, BeginCommandBuffer);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, EndCommandBuffer);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, CmdBindPipeline);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, CmdBindDescriptorSets);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, CmdDispatch);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, CmdPipelineBarrier);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, CreateSampler);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, DestroySampler);
+    
+    // Swapchain functions
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, CreateSwapchainKHR);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, DestroySwapchainKHR);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, GetSwapchainImagesKHR);
+    DEVICE_DISPATCH_TABLE_ENTRY(table, device, QueuePresentKHR);
+    
+    // Set magic number
+    table->magic = DEVICE_DISP_TABLE_MAGIC_NUMBER;
+}
+
+} // namespace layer_utils
 
 // Intercepted functions
 extern "C" {
@@ -265,7 +514,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
     
     // Initialize device dispatch table
     VkLayerDispatchTable& table = device_data->dispatch_table;
-    layer_init_device_dispatch_table(*pDevice, &table, fpGetDeviceProcAddr);
+    layer_utils::layer_init_device_dispatch_table(*pDevice, &table, fpGetDeviceProcAddr);
     
     // Get compute queue
     if (device_data->compute_queue_family != UINT32_MAX) {
@@ -660,179 +909,3 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(
 }
 
 } // extern "C"
-
-// Helper function implementations
-namespace layer_utils {
-
-uint32_t findMemoryType(const VkPhysicalDeviceMemoryProperties& mem_props,
-                       uint32_t type_filter, VkMemoryPropertyFlags properties) {
-    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
-        if ((type_filter & (1 << i)) && 
-            (mem_props.memoryTypes[i].propertyFlags & properties) == properties) {
-            return i;
-        }
-    }
-    return UINT32_MAX;
-}
-
-VkImageView createImageView(VkDevice device, VkImage image, VkFormat format,
-                           VkImageAspectFlags aspect_flags) {
-    auto device_data = LayerData::getInstance().getDevice(device);
-    if (!device_data) return VK_NULL_HANDLE;
-    
-    VkImageViewCreateInfo view_info = {};
-    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view_info.image = image;
-    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view_info.format = format;
-    view_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-    view_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-    view_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-    view_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-    view_info.subresourceRange.aspectMask = aspect_flags;
-    view_info.subresourceRange.baseMipLevel = 0;
-    view_info.subresourceRange.levelCount = 1;
-    view_info.subresourceRange.baseArrayLayer = 0;
-    view_info.subresourceRange.layerCount = 1;
-    
-    VkImageView view;
-    device_data->dispatch_table.CreateImageView(device, &view_info, nullptr, &view);
-    return view;
-}
-
-VkSemaphore createSemaphore(VkDevice device) {
-    auto device_data = LayerData::getInstance().getDevice(device);
-    if (!device_data) return VK_NULL_HANDLE;
-    
-    VkSemaphoreCreateInfo info = {};
-    info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-    
-    VkSemaphore semaphore;
-    device_data->dispatch_table.CreateSemaphore(device, &info, nullptr, &semaphore);
-    return semaphore;
-}
-
-VkFence createFence(VkDevice device, bool signaled) {
-    auto device_data = LayerData::getInstance().getDevice(device);
-    if (!device_data) return VK_NULL_HANDLE;
-    
-    VkFenceCreateInfo info = {};
-    info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    if (signaled) {
-        info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    }
-    
-    VkFence fence;
-    device_data->dispatch_table.CreateFence(device, &info, nullptr, &fence);
-    return fence;
-}
-
-VkCommandBuffer beginSingleTimeCommands(VkDevice device, VkCommandPool pool) {
-    auto device_data = LayerData::getInstance().getDevice(device);
-    if (!device_data) return VK_NULL_HANDLE;
-    
-    VkCommandBufferAllocateInfo alloc_info = {};
-    alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    alloc_info.commandPool = pool;
-    alloc_info.commandBufferCount = 1;
-    
-    VkCommandBuffer cmd_buffer;
-    device_data->dispatch_table.AllocateCommandBuffers(device, &alloc_info, &cmd_buffer);
-    
-    VkCommandBufferBeginInfo begin_info = {};
-    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    
-    device_data->dispatch_table.BeginCommandBuffer(cmd_buffer, &begin_info);
-    return cmd_buffer;
-}
-
-void endSingleTimeCommands(VkDevice device, VkCommandPool pool,
-                          VkQueue queue, VkCommandBuffer cmd_buffer) {
-    auto device_data = LayerData::getInstance().getDevice(device);
-    if (!device_data) return;
-    
-    device_data->dispatch_table.EndCommandBuffer(cmd_buffer);
-    
-    VkSubmitInfo submit_info = {};
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &cmd_buffer;
-    
-    device_data->dispatch_table.QueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE);
-    device_data->dispatch_table.QueueWaitIdle(queue);
-    
-    device_data->dispatch_table.FreeCommandBuffers(device, pool, 1, &cmd_buffer);
-}
-
-void transitionImageLayout(VkCommandBuffer cmd, VkImage image,
-                          VkImageLayout old_layout, VkImageLayout new_layout,
-                          VkImageSubresourceRange subresource_range,
-                          VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage) {
-    // Find device data from command buffer (simplified approach)
-    DeviceData* device_data = nullptr;
-    for (auto& [device, data] : LayerData::getInstance().devices) {
-        device_data = data.get();
-        break;
-    }
-    if (!device_data) return;
-    
-    VkImageMemoryBarrier barrier = {};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = old_layout;
-    barrier.newLayout = new_layout;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange = subresource_range;
-    
-    // Source access mask
-    switch (old_layout) {
-    case VK_IMAGE_LAYOUT_UNDEFINED:
-        barrier.srcAccessMask = 0;
-        break;
-    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        break;
-    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        break;
-    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        break;
-    case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
-        barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-        break;
-    default:
-        barrier.srcAccessMask = 0;
-        break;
-    }
-    
-    // Destination access mask
-    switch (new_layout) {
-    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        break;
-    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        break;
-    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        break;
-    case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
-        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-        break;
-    case VK_IMAGE_LAYOUT_GENERAL:
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        break;
-    default:
-        barrier.dstAccessMask = 0;
-        break;
-    }
-    
-    device_data->dispatch_table.CmdPipelineBarrier(
-        cmd, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-}
-
-} // namespace layer_utils
