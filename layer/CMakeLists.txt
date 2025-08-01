@@ -26,7 +26,11 @@ target_include_directories(${LAYER_NAME}
         ${FFX_SDK_DIR}/include
         ${FFX_SDK_DIR}/include/FidelityFX/gpu
         ${CMAKE_SOURCE_DIR}/include  # Add this for vk_layer_dispatch_table.h
+        ${CMAKE_BINARY_DIR}/shaders/include/shaders  # Generated shader headers
 )
+
+# Add dependency on shader headers
+add_dependencies(${LAYER_NAME} shaders)
 
 # Link libraries
 target_link_libraries(${LAYER_NAME}

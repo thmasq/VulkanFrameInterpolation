@@ -126,6 +126,7 @@ private:
     void createConstantsBuffer();
     
     VkShaderModule loadShaderModule(const std::string& path);
+    VkShaderModule loadEmbeddedShaderModule(const char* shader_name);  // Added this declaration
     
     void createFrameBuffer(SwapchainResources::FrameBuffer& buffer,
                           VkFormat format, VkExtent2D extent,

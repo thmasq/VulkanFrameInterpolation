@@ -1,26 +1,9 @@
 #include "frame_interpolator.h"
 #include "vk_layer_frame_interpolation.h"
-#include <fstream>
+#include "embedded_shaders.h"  // Generated header with embedded shaders
 #include <vector>
 #include <cstring>
 #include <iostream>
-
-// SPIR-V loading helper
-static std::vector<uint32_t> loadSPIRV(const std::string& filename) {
-    std::ifstream file(filename, std::ios::ate | std::ios::binary);
-    if (!file.is_open()) {
-        throw std::runtime_error("Failed to open SPIR-V file: " + filename);
-    }
-    
-    size_t file_size = (size_t)file.tellg();
-    std::vector<uint32_t> code(file_size / sizeof(uint32_t));
-    
-    file.seekg(0);
-    file.read((char*)code.data(), file_size);
-    file.close();
-    
-    return code;
-}
 
 FrameInterpolator::FrameInterpolator(DeviceData* device_data) 
     : device_data_(device_data) {
@@ -81,116 +64,21 @@ FrameInterpolator::~FrameInterpolator() {
     }
     
     // Destroy shader modules
-    if (optical_flow_shader_) dt.DestroyShaderModule(device, optical_flow_shader_, nullptr);
-    if (interpolation_shader_) dt.DestroyShaderModule(device, interpolation_shader_, nullptr);
-    if (motion_estimation_shader_) dt.DestroyShaderModule(device, motion_estimation_shader_, nullptr);
+    if (optical_flow_shader_) {
+        dt.DestroyShaderModule(device, optical_flow_shader_, nullptr);
+    }
+    if (interpolation_shader_) {
+        dt.DestroyShaderModule(device, interpolation_shader_, nullptr);
+    }
+    if (motion_estimation_shader_) {
+        dt.DestroyShaderModule(device, motion_estimation_shader_, nullptr);
+    }
     
-    // Destroy constants buffer
+    // Cleanup constants buffer
     if (constants_buffer_) {
         dt.DestroyBuffer(device, constants_buffer_, nullptr);
         dt.FreeMemory(device, constants_memory_, nullptr);
     }
-}
-
-void FrameInterpolator::initSwapchain(VkSwapchainKHR swapchain, VkFormat format,
-                                    VkExtent2D extent, uint32_t image_count) {
-    std::lock_guard<std::mutex> lock(resources_mutex_);
-    
-    // Create swapchain resources
-    auto resources = std::make_unique<SwapchainResources>();
-    resources->format = format;
-    resources->extent = extent;
-    resources->image_count = image_count;
-    
-    // Allocate intermediate buffers (3 for triple buffering)
-    const uint32_t buffer_count = 3;
-    resources->motion_vector_buffers.resize(buffer_count);
-    resources->optical_flow_buffers.resize(buffer_count);
-    resources->interpolated_buffers.resize(buffer_count);
-    
-    // Create buffers
-    for (uint32_t i = 0; i < buffer_count; i++) {
-        // Motion vectors (R16G16_SFLOAT)
-        createFrameBuffer(resources->motion_vector_buffers[i],
-                        VK_FORMAT_R16G16_SFLOAT, extent,
-                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-        
-        // Optical flow (R16G16_SFLOAT)
-        createFrameBuffer(resources->optical_flow_buffers[i],
-                        VK_FORMAT_R16G16_SFLOAT, extent,
-                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-        
-        // Interpolated frames (same format as swapchain)
-        createFrameBuffer(resources->interpolated_buffers[i],
-                        format, extent,
-                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
-    }
-    
-    // Allocate command buffers
-    VkCommandBufferAllocateInfo cmd_alloc_info = {};
-    cmd_alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cmd_alloc_info.commandPool = device_data_->compute_command_pool;
-    cmd_alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmd_alloc_info.commandBufferCount = buffer_count;
-    
-    resources->command_buffers.resize(buffer_count);
-    device_data_->dispatch_table.AllocateCommandBuffers(
-        device_data_->device, &cmd_alloc_info, resources->command_buffers.data());
-    
-    // Create descriptor sets
-    createDescriptorSets(*resources);
-    
-    swapchain_resources_[swapchain] = std::move(resources);
-    
-    if (device_data_->instance_data->debug_enabled) {
-        std::cout << "[Frame Interpolation] Initialized swapchain resources\n";
-        std::cout << "  Buffer count: " << buffer_count << "\n";
-    }
-}
-
-void FrameInterpolator::cleanupSwapchain(VkSwapchainKHR swapchain) {
-    std::lock_guard<std::mutex> lock(resources_mutex_);
-    
-    auto it = swapchain_resources_.find(swapchain);
-    if (it == swapchain_resources_.end()) return;
-    
-    auto& resources = it->second;
-    auto& dt = device_data_->dispatch_table;
-    VkDevice device = device_data_->device;
-    
-    // Free command buffers
-    if (!resources->command_buffers.empty()) {
-        dt.FreeCommandBuffers(device, device_data_->compute_command_pool,
-                            resources->command_buffers.size(),
-                            resources->command_buffers.data());
-    }
-    
-    // Destroy frame buffers
-    for (auto& buffer : resources->motion_vector_buffers) {
-        destroyFrameBuffer(buffer);
-    }
-    for (auto& buffer : resources->optical_flow_buffers) {
-        destroyFrameBuffer(buffer);
-    }
-    for (auto& buffer : resources->interpolated_buffers) {
-        destroyFrameBuffer(buffer);
-    }
-    
-    swapchain_resources_.erase(it);
-}
-
-VkImage FrameInterpolator::interpolateFrame(const InterpolationRequest& request) {
-    // Queue the request for async processing
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        request_queue_.push(request);
-    }
-    queue_cv_.notify_one();
-    
-    // For now, return null - in a real implementation, this would
-    // return a future or handle to track the async operation
-    return VK_NULL_HANDLE;
 }
 
 void FrameInterpolator::createConstantsBuffer() {
@@ -239,35 +127,60 @@ void FrameInterpolator::createConstantsBuffer() {
 }
 
 void FrameInterpolator::createShaderModules() {
-    // In a real implementation, these would load compiled SPIR-V shaders
-    // For now, we'll use placeholder paths
-    optical_flow_shader_ = loadShaderModule("shaders/optical_flow.spv");
-    interpolation_shader_ = loadShaderModule("shaders/interpolate_frame.spv");
-    motion_estimation_shader_ = loadShaderModule("shaders/motion_estimation.spv");
+    // Load shaders from embedded headers instead of files
+    optical_flow_shader_ = loadEmbeddedShaderModule("optical_flow");
+    interpolation_shader_ = loadEmbeddedShaderModule("interpolate_frame");
+    motion_estimation_shader_ = loadEmbeddedShaderModule("motion_estimation");
 }
 
-VkShaderModule FrameInterpolator::loadShaderModule(const std::string& path) {
+VkShaderModule FrameInterpolator::loadEmbeddedShaderModule(const char* shader_name) {
     VkDevice device = device_data_->device;
     auto& dt = device_data_->dispatch_table;
     
     try {
-        auto code = loadSPIRV(path);
-        
-        VkShaderModuleCreateInfo create_info = {};
-        create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        create_info.codeSize = code.size() * sizeof(uint32_t);
-        create_info.pCode = code.data();
-        
-        VkShaderModule module;
-        if (dt.CreateShaderModule(device, &create_info, nullptr, &module) != VK_SUCCESS) {
-            std::cerr << "[Frame Interpolation] Warning: Failed to create shader module from " 
-                      << path << "\n";
+        // Find the shader in embedded data
+        const auto* shader_data = EmbeddedShaders::find_shader(shader_name);
+        if (!shader_data) {
+            std::cerr << "[Frame Interpolation] Error: Embedded shader '" 
+                      << shader_name << "' not found\n";
             return VK_NULL_HANDLE;
         }
         
+        // Validate SPIR-V data
+        if (shader_data->size < 20 || shader_data->size % 4 != 0) {
+            std::cerr << "[Frame Interpolation] Error: Invalid SPIR-V size for " 
+                      << shader_name << ": " << shader_data->size << " bytes\n";
+            return VK_NULL_HANDLE;
+        }
+        
+        // Check SPIR-V magic number
+        const uint32_t* code = reinterpret_cast<const uint32_t*>(shader_data->data);
+        if (code[0] != 0x07230203) {
+            std::cerr << "[Frame Interpolation] Error: Invalid SPIR-V magic number for " 
+                      << shader_name << "\n";
+            return VK_NULL_HANDLE;
+        }
+        
+        VkShaderModuleCreateInfo create_info = {};
+        create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        create_info.codeSize = shader_data->size;
+        create_info.pCode = code;
+        
+        VkShaderModule module;
+        VkResult result = dt.CreateShaderModule(device, &create_info, nullptr, &module);
+        if (result != VK_SUCCESS) {
+            std::cerr << "[Frame Interpolation] Error: Failed to create shader module for " 
+                      << shader_name << " (VkResult: " << result << ")\n";
+            return VK_NULL_HANDLE;
+        }
+        
+        std::cout << "[Frame Interpolation] Successfully loaded embedded shader: " 
+                  << shader_name << " (" << shader_data->size << " bytes)\n";
+        
         return module;
     } catch (const std::exception& e) {
-        std::cerr << "[Frame Interpolation] Warning: " << e.what() << "\n";
+        std::cerr << "[Frame Interpolation] Exception loading shader " 
+                  << shader_name << ": " << e.what() << "\n";
         return VK_NULL_HANDLE;
     }
 }
@@ -317,28 +230,27 @@ void FrameInterpolator::createPipelines() {
         pipeline_info.stage = stage_info;
         pipeline_info.layout = optical_flow_pipeline_.layout;
         
-        dt.CreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
-                                nullptr, &optical_flow_pipeline_.pipeline);
+        dt.CreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr,
+                                &optical_flow_pipeline_.pipeline);
     }
     
     // Similar setup for interpolation and motion estimation pipelines...
-    // (Simplified for brevity)
+    // (Create similar descriptor layouts and pipelines for the other shaders)
     
-    // Create descriptor pool
+    // Create descriptor pools
     std::vector<VkDescriptorPoolSize> pool_sizes = {
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 100},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 100},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 100},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4}
     };
     
     VkDescriptorPoolCreateInfo pool_info = {};
     pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pool_info.poolSizeCount = pool_sizes.size();
     pool_info.pPoolSizes = pool_sizes.data();
-    pool_info.maxSets = 100;
+    pool_info.maxSets = 16;
     
-    dt.CreateDescriptorPool(device, &pool_info, nullptr,
-                          &optical_flow_pipeline_.desc_pool);
+    dt.CreateDescriptorPool(device, &pool_info, nullptr, &optical_flow_pipeline_.desc_pool);
 }
 
 void FrameInterpolator::createFrameBuffer(SwapchainResources::FrameBuffer& buffer,
