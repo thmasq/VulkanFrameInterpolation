@@ -1,0 +1,40 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_frame_interpolation",
+        "type": "GLOBAL",
+        "library_path": "libVkLayer_frame_interpolation.so",
+        "api_version": "1.3.0",
+        "implementation_version": "1",
+        "description": "Frame interpolation layer for doubling framerate using AI-based motion estimation",
+        "status": "STABLE",
+        "enable_environment": {
+            "VK_FRAME_INTERPOLATION_ENABLED": "1"
+        },
+        "disable_environment": {
+            "VK_FRAME_INTERPOLATION_ENABLED": "0"
+        },
+        "instance_extensions": [],
+        "device_extensions": [
+            {
+                "name": "VK_KHR_swapchain",
+                "spec_version": "70"
+            }
+        ],
+        "intercept_functions": {
+            "vkGetInstanceProcAddr": "vkGetInstanceProcAddr",
+            "vkGetDeviceProcAddr": "vkGetDeviceProcAddr",
+            "vkCreateInstance": "vkCreateInstance",
+            "vkDestroyInstance": "vkDestroyInstance",
+            "vkCreateDevice": "vkCreateDevice",
+            "vkDestroyDevice": "vkDestroyDevice",
+            "vkCreateSwapchainKHR": "vkCreateSwapchainKHR",
+            "vkDestroySwapchainKHR": "vkDestroySwapchainKHR",
+            "vkQueuePresentKHR": "vkQueuePresentKHR",
+            "vkEnumerateInstanceLayerProperties": "vkEnumerateInstanceLayerProperties",
+            "vkEnumerateDeviceLayerProperties": "vkEnumerateDeviceLayerProperties",
+            "vkEnumerateInstanceExtensionProperties": "vkEnumerateInstanceExtensionProperties",
+            "vkEnumerateDeviceExtensionProperties": "vkEnumerateDeviceExtensionProperties"
+        }
+    }
+}

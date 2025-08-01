@@ -1,0 +1,182 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+
+// Workgroup size
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Descriptor bindings
+layout(set = 0, binding = 0) uniform sampler2D previousFrame;
+layout(set = 0, binding = 1) uniform sampler2D currentFrame;
+layout(set = 0, binding = 2) uniform sampler2D opticalFlow;
+layout(set = 0, binding = 3) uniform sampler2D motionVectors;
+layout(set = 0, binding = 4) uniform sampler2D depthBuffer;
+layout(set = 0, binding = 5, rgba8) uniform writeonly image2D outputFrame;
+
+// Constants buffer
+layout(set = 0, binding = 6) uniform InterpolationConstants {
+    vec2 motionScale;
+    float interpolationFactor;
+    float depthThreshold;
+    float motionThreshold;
+    float disocclusionThreshold;
+    uint frameWidth;
+    uint frameHeight;
+    uint blockSize;
+    uint searchRadius;
+    uint qualityLevel;
+    uint _padding;
+} constants;
+
+// Shared memory for block processing
+shared vec3 sharedPrevBlock[10][10];  // 8x8 + 1 pixel border
+shared vec3 sharedCurrBlock[10][10];
+shared vec2 sharedFlowBlock[10][10];
+
+// Helper functions
+vec2 getMotionVector(ivec2 coord) {
+    vec2 flow = texture(opticalFlow, (vec2(coord) + 0.5) / vec2(constants.frameWidth, constants.frameHeight)).xy;
+    return flow * constants.motionScale;
+}
+
+float getDepth(sampler2D depthTex, vec2 uv) {
+    return texture(depthTex, uv).r;
+}
+
+bool isDisoccluded(vec2 currUV, vec2 prevUV) {
+    float currDepth = getDepth(depthBuffer, currUV);
+    float prevDepth = getDepth(depthBuffer, prevUV);
+    
+    // Check depth discontinuity
+    float depthDiff = abs(currDepth - prevDepth);
+    return depthDiff > constants.depthThreshold;
+}
+
+vec3 sampleWithMotionBlur(sampler2D tex, vec2 uv, vec2 motion, float factor) {
+    vec3 color = vec3(0.0);
+    float totalWeight = 0.0;
+    
+    const int samples = 5;
+    for (int i = 0; i < samples; i++) {
+        float t = float(i) / float(samples - 1) - 0.5;
+        vec2 sampleUV = uv + motion * t * factor;
+        
+        if (all(greaterThanEqual(sampleUV, vec2(0.0))) && all(lessThan(sampleUV, vec2(1.0)))) {
+            float weight = 1.0 - abs(t);
+            color += texture(tex, sampleUV).rgb * weight;
+            totalWeight += weight;
+        }
+    }
+    
+    return totalWeight > 0.0 ? color / totalWeight : texture(tex, uv).rgb;
+}
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    
+    // Early exit for out-of-bounds
+    if (any(greaterThanEqual(pixelCoord, ivec2(constants.frameWidth, constants.frameHeight)))) {
+        return;
+    }
+    
+    // Load data into shared memory
+    uint localID = gl_LocalInvocationID.x + gl_LocalInvocationID.y * 8;
+    if (localID < 100) {
+        ivec2 blockOffset = ivec2(gl_WorkGroupID.xy) * 8 - 1;
+        ivec2 sharedCoord = ivec2(localID % 10, localID / 10);
+        ivec2 globalCoord = blockOffset + sharedCoord;
+        
+        vec2 uv = (vec2(globalCoord) + 0.5) / vec2(constants.frameWidth, constants.frameHeight);
+        sharedPrevBlock[sharedCoord.y][sharedCoord.x] = texture(previousFrame, uv).rgb;
+        sharedCurrBlock[sharedCoord.y][sharedCoord.x] = texture(currentFrame, uv).rgb;
+        sharedFlowBlock[sharedCoord.y][sharedCoord.x] = texture(opticalFlow, uv).xy;
+    }
+    
+    barrier();
+    
+    // Get current pixel UV
+    vec2 uv = (vec2(pixelCoord) + 0.5) / vec2(constants.frameWidth, constants.frameHeight);
+    
+    // Get motion vectors
+    vec2 motionVec = getMotionVector(pixelCoord);
+    vec2 halfMotion = motionVec * constants.interpolationFactor;
+    
+    // Calculate interpolated position
+    vec2 prevUV = uv - halfMotion;
+    vec2 nextUV = uv + halfMotion * (1.0 - constants.interpolationFactor);
+    
+    // Sample colors
+    vec3 prevColor = texture(previousFrame, prevUV).rgb;
+    vec3 currColor = texture(currentFrame, nextUV).rgb;
+    
+    // Check for disocclusion
+    bool disoccluded = isDisoccluded(uv, prevUV);
+    
+    // Calculate interpolation weights
+    float weight = constants.interpolationFactor;
+    
+    if (disoccluded) {
+        // Handle disocclusion - use more of the current frame
+        weight = min(weight + 0.3, 1.0);
+        
+        // Try to find better match using optical flow refinement
+        vec2 refinedFlow = texture(opticalFlow, uv).xy * constants.motionScale;
+        if (length(refinedFlow) < length(motionVec) * 0.7) {
+            motionVec = refinedFlow;
+            halfMotion = motionVec * constants.interpolationFactor;
+            prevUV = uv - halfMotion;
+            prevColor = texture(previousFrame, prevUV).rgb;
+            disoccluded = false;
+        }
+    }
+    
+    // Apply motion blur for fast-moving regions
+    float motionMagnitude = length(motionVec * vec2(constants.frameWidth, constants.frameHeight));
+    vec3 interpolatedColor;
+    
+    if (motionMagnitude > constants.motionThreshold) {
+        // Use motion blur for fast movement
+        vec3 blurredPrev = sampleWithMotionBlur(previousFrame, prevUV, motionVec, weight);
+        vec3 blurredCurr = sampleWithMotionBlur(currentFrame, nextUV, -motionVec, 1.0 - weight);
+        interpolatedColor = mix(blurredPrev, blurredCurr, weight);
+    } else {
+        // Simple bilinear interpolation for slow movement
+        interpolatedColor = mix(prevColor, currColor, weight);
+    }
+    
+    // Edge-aware filtering using shared memory
+    if (constants.qualityLevel >= 2) {
+        vec3 filtered = interpolatedColor;
+        float totalWeight = 1.0;
+        
+        ivec2 localCoord = ivec2(gl_LocalInvocationID.xy) + 1;
+        vec3 centerColor = sharedCurrBlock[localCoord.y][localCoord.x];
+        
+        // 3x3 edge-aware filter
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0) continue;
+                
+                ivec2 sampleCoord = localCoord + ivec2(dx, dy);
+                vec3 sampleColor = sharedCurrBlock[sampleCoord.y][sampleCoord.x];
+                
+                // Color similarity weight
+                float colorDiff = length(sampleColor - centerColor);
+                float colorWeight = exp(-colorDiff * colorDiff * 10.0);
+                
+                // Spatial weight
+                float spatialWeight = 1.0 / (1.0 + length(vec2(dx, dy)));
+                
+                float weight = colorWeight * spatialWeight;
+                filtered += sampleColor * weight;
+                totalWeight += weight;
+            }
+        }
+        
+        interpolatedColor = mix(interpolatedColor, filtered / totalWeight, 0.3);
+    }
+    
+    // Clamp and output
+    interpolatedColor = clamp(interpolatedColor, 0.0, 1.0);
+    imageStore(outputFrame, pixelCoord, vec4(interpolatedColor, 1.0));
+}

@@ -1,0 +1,49 @@
+# Uninstall script template
+
+if(NOT EXISTS "@CMAKE_BINARY_DIR@/install_manifest.txt")
+    message(FATAL_ERROR "Cannot find install manifest: @CMAKE_BINARY_DIR@/install_manifest.txt")
+endif()
+
+file(READ "@CMAKE_BINARY_DIR@/install_manifest.txt" files)
+string(REGEX REPLACE "\n" ";" files "${files}")
+
+foreach(file ${files})
+    message(STATUS "Uninstalling $ENV{DESTDIR}${file}")
+    if(IS_SYMLINK "$ENV{DESTDIR}${file}" OR EXISTS "$ENV{DESTDIR}${file}")
+        exec_program(
+            "@CMAKE_COMMAND@" ARGS "-E remove \"$ENV{DESTDIR}${file}\""
+            OUTPUT_VARIABLE rm_out
+            RETURN_VALUE rm_retval
+        )
+        if(NOT "${rm_retval}" STREQUAL 0)
+            message(FATAL_ERROR "Problem when removing $ENV{DESTDIR}${file}")
+        endif()
+    else()
+        message(STATUS "File $ENV{DESTDIR}${file} does not exist.")
+    endif()
+endforeach()
+
+# Remove layer manifest files
+set(layer_manifest_dir "@CMAKE_INSTALL_PREFIX@/share/vulkan/implicit_layer.d")
+if(EXISTS "${layer_manifest_dir}/VkLayer_frame_interpolation.json")
+    message(STATUS "Removing layer manifest: ${layer_manifest_dir}/VkLayer_frame_interpolation.json")
+    file(REMOVE "${layer_manifest_dir}/VkLayer_frame_interpolation.json")
+endif()
+
+set(explicit_layer_manifest_dir "@CMAKE_INSTALL_PREFIX@/share/vulkan/explicit_layer.d")
+if(EXISTS "${explicit_layer_manifest_dir}/VkLayer_frame_interpolation_explicit.json")
+    message(STATUS "Removing explicit layer manifest: ${explicit_layer_manifest_dir}/VkLayer_frame_interpolation_explicit.json")
+    file(REMOVE "${explicit_layer_manifest_dir}/VkLayer_frame_interpolation_explicit.json")
+endif()
+
+# Remove shader directory if empty
+set(shader_dir "@CMAKE_INSTALL_PREFIX@/share/vulkan/shaders/frame_interpolation")
+if(EXISTS "${shader_dir}")
+    file(GLOB shader_files "${shader_dir}/*")
+    if(NOT shader_files)
+        message(STATUS "Removing empty shader directory: ${shader_dir}")
+        file(REMOVE_RECURSE "${shader_dir}")
+    endif()
+endif()
+
+message(STATUS "Uninstall complete")

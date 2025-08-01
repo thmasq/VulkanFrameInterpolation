@@ -1,0 +1,22 @@
+#version 450
+
+// Placeholder for optical flow computation
+// This would implement AMD FidelityFX Optical Flow algorithm
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D previousFrame;
+layout(set = 0, binding = 1) uniform sampler2D currentFrame;
+layout(set = 0, binding = 2, rg16f) uniform writeonly image2D opticalFlowField;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    
+    // Placeholder: simple frame difference
+    vec2 uv = (vec2(coord) + 0.5) / vec2(imageSize(opticalFlowField));
+    vec3 prev = texture(previousFrame, uv).rgb;
+    vec3 curr = texture(currentFrame, uv).rgb;
+    
+    vec2 flow = (curr.xy - prev.xy) * 0.1;
+    imageStore(opticalFlowField, coord, vec4(flow, 0.0, 0.0));
+}

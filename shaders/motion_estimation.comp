@@ -1,0 +1,194 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+
+// Based on AMD FidelityFX Optical Flow principles
+// Uses 8x8 block matching with SAD (Sum of Absolute Differences)
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Descriptor bindings
+layout(set = 0, binding = 0) uniform sampler2D previousFrame;
+layout(set = 0, binding = 1) uniform sampler2D currentFrame;
+layout(set = 0, binding = 2, rg16f) uniform writeonly image2D motionVectorField;
+layout(set = 0, binding = 3, r16f) uniform writeonly image2D confidenceMap;
+
+// Constants
+layout(set = 0, binding = 4) uniform MotionEstimationConstants {
+    uvec2 frameSize;
+    uvec2 blockSize;  // 8x8
+    uint searchRadius;  // 16 pixels
+    uint pyramidLevel;
+    float sadThreshold;
+    float subpixelRefinement;
+} constants;
+
+// Shared memory for block data
+shared float sharedPrevBlock[24][24];  // Search area + block size
+shared float sharedCurrBlock[8][8];    // Current block
+
+// Convert RGB to luminance
+float rgbToLuma(vec3 color) {
+    return dot(color, vec3(0.299, 0.587, 0.114));
+}
+
+// Load block data into shared memory
+void loadSharedData() {
+    ivec2 blockStart = ivec2(gl_WorkGroupID.xy) * ivec2(constants.blockSize);
+    ivec2 searchStart = blockStart - ivec2(constants.searchRadius);
+    
+    // Load previous frame search area (cooperative loading)
+    uint tid = gl_LocalInvocationID.x + gl_LocalInvocationID.y * 8;
+    uint totalPixels = 24 * 24;
+    
+    for (uint i = tid; i < totalPixels; i += 64) {
+        ivec2 localCoord = ivec2(i % 24, i / 24);
+        ivec2 globalCoord = searchStart + localCoord;
+        
+        vec2 uv = (vec2(globalCoord) + 0.5) / vec2(constants.frameSize);
+        vec3 color = texture(previousFrame, uv).rgb;
+        sharedPrevBlock[localCoord.y][localCoord.x] = rgbToLuma(color);
+    }
+    
+    // Load current block
+    if (all(lessThan(gl_LocalInvocationID.xy, constants.blockSize))) {
+        ivec2 globalCoord = blockStart + ivec2(gl_LocalInvocationID.xy);
+        vec2 uv = (vec2(globalCoord) + 0.5) / vec2(constants.frameSize);
+        vec3 color = texture(currentFrame, uv).rgb;
+        sharedCurrBlock[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = rgbToLuma(color);
+    }
+    
+    barrier();
+}
+
+// Calculate SAD for a block
+float calculateSAD(ivec2 offset) {
+    float sad = 0.0;
+    
+    // Only thread 0 in each work group calculates SAD
+    if (gl_LocalInvocationID.x == 0 && gl_LocalInvocationID.y == 0) {
+        for (uint y = 0; y < constants.blockSize.y; y++) {
+            for (uint x = 0; x < constants.blockSize.x; x++) {
+                float curr = sharedCurrBlock[y][x];
+                float prev = sharedPrevBlock[y + offset.y + constants.searchRadius]
+                                            [x + offset.x + constants.searchRadius];
+                sad += abs(curr - prev);
+            }
+        }
+    }
+    
+    return sad;
+}
+
+// Subpixel refinement using parabolic fitting
+vec2 refineSubpixel(vec2 bestOffset, float centerSAD, float leftSAD, float rightSAD, 
+                    float topSAD, float bottomSAD) {
+    vec2 refined = bestOffset;
+    
+    // Horizontal refinement
+    if (leftSAD < 999999.0 && rightSAD < 999999.0) {
+        float denom = 2.0 * (leftSAD - 2.0 * centerSAD + rightSAD);
+        if (abs(denom) > 0.0001) {
+            refined.x += (leftSAD - rightSAD) / denom;
+        }
+    }
+    
+    // Vertical refinement
+    if (topSAD < 999999.0 && bottomSAD < 999999.0) {
+        float denom = 2.0 * (topSAD - 2.0 * centerSAD + bottomSAD);
+        if (abs(denom) > 0.0001) {
+            refined.y += (topSAD - bottomSAD) / denom;
+        }
+    }
+    
+    return refined;
+}
+
+void main() {
+    // Load shared data
+    loadSharedData();
+    
+    // Only one thread per work group performs the search
+    if (gl_LocalInvocationID.x != 0 || gl_LocalInvocationID.y != 0) {
+        return;
+    }
+    
+    ivec2 blockCoord = ivec2(gl_WorkGroupID.xy);
+    
+    // Hierarchical search: start with coarse search
+    float bestSAD = 999999.0;
+    ivec2 bestOffset = ivec2(0);
+    
+    // Coarse search (every 2 pixels)
+    const int coarseStep = 2;
+    for (int dy = -int(constants.searchRadius); dy <= int(constants.searchRadius); dy += coarseStep) {
+        for (int dx = -int(constants.searchRadius); dx <= int(constants.searchRadius); dx += coarseStep) {
+            ivec2 offset = ivec2(dx, dy);
+            float sad = calculateSAD(offset);
+            
+            if (sad < bestSAD) {
+                bestSAD = sad;
+                bestOffset = offset;
+            }
+        }
+    }
+    
+    // Fine search around best coarse match
+    ivec2 fineSearchCenter = bestOffset;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            ivec2 offset = fineSearchCenter + ivec2(dx, dy);
+            
+            // Check bounds
+            if (any(lessThan(offset, -ivec2(constants.searchRadius))) ||
+                any(greaterThan(offset, ivec2(constants.searchRadius)))) {
+                continue;
+            }
+            
+            float sad = calculateSAD(offset);
+            if (sad < bestSAD) {
+                bestSAD = sad;
+                bestOffset = offset;
+            }
+        }
+    }
+    
+    // Subpixel refinement
+    vec2 motionVector = vec2(bestOffset);
+    if (constants.subpixelRefinement > 0.0 && bestSAD < constants.sadThreshold) {
+        // Calculate SAD for neighboring pixels
+        float leftSAD = calculateSAD(bestOffset + ivec2(-1, 0));
+        float rightSAD = calculateSAD(bestOffset + ivec2(1, 0));
+        float topSAD = calculateSAD(bestOffset + ivec2(0, -1));
+        float bottomSAD = calculateSAD(bestOffset + ivec2(0, 1));
+        
+        motionVector = refineSubpixel(vec2(bestOffset), bestSAD, 
+                                     leftSAD, rightSAD, topSAD, bottomSAD);
+    }
+    
+    // Normalize motion vector to UV space
+    vec2 normalizedMotion = motionVector / vec2(constants.frameSize);
+    
+    // Calculate confidence based on SAD
+    float confidence = 1.0 - min(bestSAD / (constants.blockSize.x * constants.blockSize.y * 255.0), 1.0);
+    confidence = pow(confidence, 2.0);  // Non-linear mapping
+    
+    // Apply pyramid scale
+    float pyramidScale = float(1 << constants.pyramidLevel);
+    normalizedMotion *= pyramidScale;
+    
+    // Write results
+    ivec2 outputCoord = blockCoord;
+    imageStore(motionVectorField, outputCoord, vec4(normalizedMotion, 0.0, 0.0));
+    imageStore(confidenceMap, outputCoord, vec4(confidence));
+    
+    // Also write to neighboring pixels in the block (block-based motion)
+    for (uint y = 0; y < constants.blockSize.y; y++) {
+        for (uint x = 0; x < constants.blockSize.x; x++) {
+            ivec2 pixelCoord = blockCoord * ivec2(constants.blockSize) + ivec2(x, y);
+            if (all(lessThan(pixelCoord, constants.frameSize))) {
+                imageStore(motionVectorField, pixelCoord, vec4(normalizedMotion, 0.0, 0.0));
+                imageStore(confidenceMap, pixelCoord, vec4(confidence));
+            }
+        }
+    }
+}

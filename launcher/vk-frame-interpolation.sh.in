@@ -1,0 +1,3 @@
+#!/bin/bash
+# Vulkan Frame Interpolation Launcher Wrapper
+exec "@CMAKE_INSTALL_PREFIX@/bin/vk-frame-interpolation" "$@"
